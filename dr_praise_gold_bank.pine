@@ -1,0 +1,514 @@
+//@version=5
+strategy("Dr Praise Gold Bank", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1, max_bars_back=500, calc_on_order_fills=true, calc_on_every_tick=false, initial_capital=50000, currency=currency.USD)
+
+// === STRATEGY SETTINGS ===
+// Risk Management
+contracts = input.int(1, "Contracts", minval=1, group="Risk Management")
+risk_multiplier = input.float(5.0, "Risk:Reward Multiplier", minval=0.5, maxval=10.0, group="Risk Management")
+sl_points = input.int(2, "Stop Loss Points Below/Above Breakout Candle", minval=1, group="Risk Management")
+
+// Entry Settings
+entry_type = input.string("Instant", "Entry Type", options=["Retracement", "Instant"], group="Entry Settings")
+retracement_percent = input.float(50.0, "Retracement % of Breakout Candle Body", minval=10.0, maxval=90.0, group="Entry Settings")
+
+// Stop Loss Settings
+sl_type = input.string("Opposite Range", "Stop Loss Type", options=["Breakout Candle", "Opposite Range"], group="Stop Loss Settings")
+
+// Second Chance Trade Settings
+enable_second_chance = input.bool(true, "Enable Second Chance Trade", group="Second Chance Trade")
+second_chance_info = input.string("If initial SL is hit, allow opposite breakout trade", "Info: Second Chance Logic", group="Second Chance Trade")
+
+// Breakout Filter Settings
+use_wick_filter = input.bool(true, "Use Wick Filter", group="Breakout Filter")
+max_wick_percent = input.float(50.0, "Max Wick % of Candle Body", minval=10.0, maxval=200.0, group="Breakout Filter")
+
+// Breakout Distance Filters
+use_breakout_distance_filter = input.bool(true, "Use Breakout Distance Filter", group="Breakout Distance Filter")
+min_breakout_multiplier = input.float(0.1, "Min Breakout Distance (OR Size * X)", minval=0.0, maxval=3.0, group="Breakout Distance Filter")
+max_breakout_multiplier = input.float(1.6, "Max Breakout Distance (OR Size * X)", minval=0.5, maxval=5.0, group="Breakout Distance Filter")
+
+// Trailing Stop Loss Settings
+use_trailing_sl = input.bool(false, "Use Trailing Stop Loss", group="Trailing Stop Loss")
+profit_r_multiplier = input.float(1.0, "Start Trailing After X R Profit", minval=0.5, maxval=5.0, group="Trailing Stop Loss")
+atr_length = input.int(14, "ATR Length", minval=1, maxval=50, group="Trailing Stop Loss")
+atr_multiplier = input.float(1.0, "ATR Multiplier for Trailing", minval=0.5, maxval=5.0, group="Trailing Stop Loss")
+
+// Session Management
+or_start_hour = input.int(9, "Opening Range Start Hour", minval=0, maxval=23, group="Session Management")
+or_start_minute = input.int(30, "Opening Range Start Minute", minval=0, maxval=59, group="Session Management")
+or_end_minute = input.int(35, "Opening Range End Minute", minval=0, maxval=59, group="Session Management")
+session_timezone = input.string("America/New_York", "Session Timezone", group="Session Management")
+force_session_close = input.bool(true, "Force Close at Session End", group="Session Management")
+session_end_hour = input.int(16, "Session End Hour", minval=0, maxval=23, group="Session Management")
+session_end_minute = input.int(0, "Session End Minute", minval=0, maxval=59, group="Session Management")
+
+// Day of Week Trading Filters
+trade_monday = input.bool(true, "Trade on Monday", group="Day of Week Filters")
+trade_tuesday = input.bool(true, "Trade on Tuesday", group="Day of Week Filters")
+trade_wednesday = input.bool(true, "Trade on Wednesday", group="Day of Week Filters")
+trade_thursday = input.bool(true, "Trade on Thursday", group="Day of Week Filters")
+trade_friday = input.bool(true, "Trade on Friday", group="Day of Week Filters")
+
+// Visual Settings
+high_line_color = input.color(color.green, title="Opening Range High Line Color", group="Visual Settings")
+low_line_color = input.color(color.red, title="Opening Range Low Line Color", group="Visual Settings")
+
+// Label Control Settings
+show_trading_disabled_labels = input.bool(false, "Show Trading Disabled Labels", group="Label Controls")
+show_breakout_validation_labels = input.bool(false, "Show Breakout Validation Labels", group="Label Controls")
+show_second_chance_labels = input.bool(false, "Show Second Chance Labels", group="Label Controls")
+show_trade_status_labels = input.bool(false, "Show Trade Status Labels", group="Label Controls")
+show_entry_labels = input.bool(true, "Show Entry Labels", group="Label Controls")
+show_sl_tp_labels = input.bool(true, "Show Stop Loss / Take Profit Labels", group="Label Controls")
+
+// === VARIABLES ===
+// ATR for trailing stop loss
+atr = ta.atr(atr_length)
+
+// === NYSE OPENING RANGE LOGIC ===
+current_time = time(timeframe.period, "0000-2400:23456", session_timezone)
+current_hour = hour(current_time, session_timezone)
+current_minute = minute(current_time, session_timezone)
+is_opening_range = current_hour == or_start_hour and current_minute >= or_start_minute and current_minute <= or_end_minute
+
+// Check if we're at the start of a new trading day
+is_new_day = ta.change(time("1D"))
+
+// Check if trading is allowed on current day of week
+current_day = dayofweek(current_time, session_timezone)
+is_trading_day_allowed = (current_day == dayofweek.monday and trade_monday) or (current_day == dayofweek.tuesday and trade_tuesday) or (current_day == dayofweek.wednesday and trade_wednesday) or (current_day == dayofweek.thursday and trade_thursday) or (current_day == dayofweek.friday and trade_friday)
+
+// Variables to store opening range high and low for current day
+var float or_high = na
+var float or_low = na
+var bool lines_drawn = false
+var bool breakout_occurred = false
+var float breakout_candle_high = na
+var float breakout_candle_low = na
+var float breakout_price = na
+var string breakout_direction = na
+var int or_start_bar = na
+
+// Second chance trade variables
+var bool first_trade_sl_hit = false
+var string first_trade_direction = na
+var bool second_chance_available = false
+var bool second_trade_taken = false
+var bool daily_trades_complete = false
+
+// Reset variables at the start of each trading day
+if is_new_day
+    or_high := na
+    or_low := na
+    lines_drawn := false
+    breakout_occurred := false
+    breakout_candle_high := na
+    breakout_candle_low := na
+    breakout_price := na
+    breakout_direction := na
+    or_start_bar := na
+    first_trade_sl_hit := false
+    first_trade_direction := na
+    second_chance_available := false
+    second_trade_taken := false
+    daily_trades_complete := false
+
+// Capture opening range data during 09:30-09:35 EST
+if is_opening_range
+    if na(or_high) or na(or_low)
+        or_high := high
+        or_low := low
+        or_start_bar := bar_index
+    else
+        or_high := math.max(or_high, high)
+        or_low := math.min(or_low, low)
+
+// Draw lines when we're past the opening range and haven't drawn yet
+if not is_opening_range and not na(or_high) and not na(or_low) and not na(or_start_bar) and not lines_drawn
+    start_x = or_start_bar
+    end_x = bar_index + 50
+
+    line.new(x1=start_x, y1=or_high, x2=end_x, y2=or_high, color=high_line_color, style=line.style_dotted, width=2)
+    line.new(x1=start_x, y1=or_low, x2=end_x, y2=or_low, color=low_line_color, style=line.style_dotted, width=2)
+
+    lines_drawn := true
+
+    if not is_trading_day_allowed and show_trading_disabled_labels
+        day_name = current_day == dayofweek.monday ? "Monday" :
+                   current_day == dayofweek.tuesday ? "Tuesday" :
+                   current_day == dayofweek.wednesday ? "Wednesday" :
+                   current_day == dayofweek.thursday ? "Thursday" :
+                   current_day == dayofweek.friday ? "Friday" : "Weekend"
+        label.new(x=bar_index, y=(or_high + or_low) / 2, text="Trading Disabled\n" + day_name, color=color.gray, textcolor=color.white, style=label.style_label_center, size=size.normal)
+
+// Check for breakouts after opening range is complete
+if barstate.isconfirmed and not is_opening_range and not na(or_high) and not na(or_low) and lines_drawn and not breakout_occurred and not daily_trades_complete and is_trading_day_allowed
+    candle_body = math.abs(close - open)
+    top_wick = high - math.max(open, close)
+    bottom_wick = math.min(open, close) - low
+    top_wick_percent = candle_body > 0 ? (top_wick / candle_body) * 100 : 0
+    bottom_wick_percent = candle_body > 0 ? (bottom_wick / candle_body) * 100 : 0
+
+    or_size = or_high - or_low
+
+    if close > or_high
+        breakout_occurred := true
+        breakout_candle_high := high
+        breakout_candle_low := low
+        breakout_price := close
+        breakout_direction := "long"
+
+        breakout_distance_valid = true
+        if use_breakout_distance_filter
+            min_breakout_level = or_high + (or_size * min_breakout_multiplier)
+            max_breakout_level = or_high + (or_size * max_breakout_multiplier)
+            breakout_distance_valid := close >= min_breakout_level and close <= max_breakout_level
+
+        wick_filter_valid = not use_wick_filter or top_wick_percent <= max_wick_percent
+
+        if show_breakout_validation_labels
+            if wick_filter_valid and breakout_distance_valid
+                label.new(x=bar_index, y=high, text="VALID", color=high_line_color, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+            else
+                label.new(x=bar_index, y=high, text="INVALID", color=color.gray, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+        if not (wick_filter_valid and breakout_distance_valid)
+            breakout_direction := "invalid"
+
+    else if close < or_low
+        breakout_occurred := true
+        breakout_candle_high := high
+        breakout_candle_low := low
+        breakout_price := close
+        breakout_direction := "short"
+
+        breakout_distance_valid = true
+        if use_breakout_distance_filter
+            min_breakout_level = or_low - (or_size * min_breakout_multiplier)
+            max_breakout_level = or_low - (or_size * max_breakout_multiplier)
+            breakout_distance_valid := close <= min_breakout_level and close >= max_breakout_level
+
+        wick_filter_valid = not use_wick_filter or bottom_wick_percent <= max_wick_percent
+
+        if show_breakout_validation_labels
+            if wick_filter_valid and breakout_distance_valid
+                label.new(x=bar_index, y=low, text="VALID", color=low_line_color, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+            else
+                label.new(x=bar_index, y=low, text="INVALID", color=color.gray, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+        if not (wick_filter_valid and breakout_distance_valid)
+            breakout_direction := "invalid"
+
+// Check for second chance breakout
+if barstate.isconfirmed and not is_opening_range and not na(or_high) and not na(or_low) and lines_drawn and second_chance_available and not second_trade_taken and not daily_trades_complete and is_trading_day_allowed
+    candle_body = math.abs(close - open)
+    top_wick = high - math.max(open, close)
+    bottom_wick = math.min(open, close) - low
+    top_wick_percent = candle_body > 0 ? (top_wick / candle_body) * 100 : 0
+    bottom_wick_percent = candle_body > 0 ? (bottom_wick / candle_body) * 100 : 0
+
+    or_size = or_high - or_low
+
+    if first_trade_direction == "long" and close < or_low
+        second_trade_taken := true
+        second_chance_available := false
+        breakout_candle_high := high
+        breakout_candle_low := low
+        breakout_price := close
+        breakout_direction := "short"
+
+        breakout_distance_valid = true
+        if use_breakout_distance_filter
+            min_breakout_level = or_low - (or_size * min_breakout_multiplier)
+            max_breakout_level = or_low - (or_size * max_breakout_multiplier)
+            breakout_distance_valid := close <= min_breakout_level and close >= max_breakout_level
+
+        wick_filter_valid = not use_wick_filter or bottom_wick_percent <= max_wick_percent
+
+        if show_second_chance_labels
+            if wick_filter_valid and breakout_distance_valid
+                label.new(x=bar_index, y=low, text="2nd Chance\nOR Low Break\nVALID", color=color.orange, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+            else
+                label.new(x=bar_index, y=low, text="2nd Chance\nOR Low Break\nINVALID", color=color.gray, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+        if not (wick_filter_valid and breakout_distance_valid)
+            breakout_direction := "invalid"
+
+    else if first_trade_direction == "short" and close > or_high
+        second_trade_taken := true
+        second_chance_available := false
+        breakout_candle_high := high
+        breakout_candle_low := low
+        breakout_price := close
+        breakout_direction := "long"
+
+        breakout_distance_valid = true
+        if use_breakout_distance_filter
+            min_breakout_level = or_high + (or_size * min_breakout_multiplier)
+            max_breakout_level = or_high + (or_size * max_breakout_multiplier)
+            breakout_distance_valid := close >= min_breakout_level and close <= max_breakout_level
+
+        wick_filter_valid = not use_wick_filter or top_wick_percent <= max_wick_percent
+
+        if show_second_chance_labels
+            if wick_filter_valid and breakout_distance_valid
+                label.new(x=bar_index, y=high, text="2nd Chance\nOR High Break\nVALID", color=color.orange, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+            else
+                label.new(x=bar_index, y=high, text="2nd Chance\nOR High Break\nINVALID", color=color.gray, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+        if not (wick_filter_valid and breakout_distance_valid)
+            breakout_direction := "invalid"
+
+// === STRATEGY LOGIC ===
+var bool entry_placed = false
+var bool second_entry_placed = false
+var float entry_price = na
+var float stop_loss = na
+var float take_profit = na
+var float trailing_stop = na
+var bool trailing_active = false
+var float initial_risk = na
+var bool trailing_started = false
+var string current_entry_id = na
+
+var array<box> historical_trade_boxes = array.new<box>()
+var array<box> historical_sl_boxes = array.new<box>()
+var array<box> historical_tp_boxes = array.new<box>()
+
+var box current_profit_box = na
+var box current_sl_box = na
+
+// Extend boxes when position closes
+if barstate.isconfirmed and strategy.position_size == 0 and strategy.position_size[1] != 0
+    if not na(current_profit_box)
+        box_left = box.get_left(current_profit_box)
+        min_right = box_left + 8
+        final_right = math.max(min_right, bar_index)
+        box.set_right(current_profit_box, final_right)
+        current_profit_box := na
+    if not na(current_sl_box)
+        box_left = box.get_left(current_sl_box)
+        min_right = box_left + 8
+        final_right = math.max(min_right, bar_index)
+        box.set_right(current_sl_box, final_right)
+        current_sl_box := na
+
+// Backup safety check
+if not na(current_profit_box) and strategy.position_size == 0
+    box_left = box.get_left(current_profit_box)
+    min_right = box_left + 8
+    final_right = math.max(min_right, bar_index)
+    box.set_right(current_profit_box, final_right)
+    current_profit_box := na
+if not na(current_sl_box) and strategy.position_size == 0
+    box_left = box.get_left(current_sl_box)
+    min_right = box_left + 8
+    final_right = math.max(min_right, bar_index)
+    box.set_right(current_sl_box, final_right)
+    current_sl_box := na
+
+// Reset entry flag on new day
+if is_new_day
+    entry_placed := false
+    second_entry_placed := false
+    entry_price := na
+    stop_loss := na
+    take_profit := na
+    trailing_stop := na
+    trailing_active := false
+    initial_risk := na
+    trailing_started := false
+    current_entry_id := na
+    current_profit_box := na
+    current_sl_box := na
+
+// Detect when position closes to enable second chance
+if barstate.isconfirmed and strategy.position_size == 0 and strategy.position_size[1] != 0 and entry_placed and not first_trade_sl_hit
+    if enable_second_chance and not second_trade_taken
+        first_trade_sl_hit := true
+        first_trade_direction := breakout_direction
+        second_chance_available := true
+
+        entry_price := na
+        trailing_stop := na
+        trailing_active := false
+        initial_risk := na
+        trailing_started := false
+        current_entry_id := na
+
+        if show_trade_status_labels
+            label.new(x=bar_index, y=close, text="Trade Closed\nSecond Chance Available", color=color.yellow, textcolor=color.black, style=label.style_label_down, size=size.tiny)
+    else
+        daily_trades_complete := true
+
+// Handle case where first breakout was invalid
+if breakout_occurred and breakout_direction == "invalid" and enable_second_chance and not first_trade_sl_hit
+    first_trade_sl_hit := true
+    first_trade_direction := breakout_price > or_high ? "long" : "short"
+    second_chance_available := true
+    if show_trade_status_labels
+        label.new(x=bar_index + 1, y=(or_high + or_low) / 2, text="First Breakout Invalid\nSecond Chance Available", color=color.yellow, textcolor=color.black, style=label.style_label_center, size=size.tiny)
+
+// Place entry orders after breakout
+if barstate.isconfirmed and not daily_trades_complete and is_trading_day_allowed and ((breakout_occurred and not entry_placed and not na(breakout_candle_high) and breakout_direction != "invalid") or (second_trade_taken and not second_entry_placed and not na(breakout_candle_high) and breakout_direction != "invalid"))
+    if breakout_direction == "long"
+        if sl_type == "Breakout Candle"
+            stop_loss := breakout_candle_low - (sl_points * syminfo.mintick)
+        else
+            stop_loss := or_low - (sl_points * syminfo.mintick)
+
+        if entry_type == "Retracement"
+            breakout_candle_body = breakout_candle_high - breakout_candle_low
+            retracement_amount = breakout_candle_body * (retracement_percent / 100)
+            entry_price := breakout_candle_high - retracement_amount
+            current_entry_id := second_trade_taken ? "Long Retracement 2nd" : "Long Retracement"
+            strategy.entry(current_entry_id, strategy.long, limit=entry_price, qty=contracts)
+            if show_entry_labels
+                entry_label_text = second_trade_taken ? "BUY LIMIT (2nd)\n" + str.tostring(entry_price, "#.##") : "BUY LIMIT\n" + str.tostring(entry_price, "#.##")
+                label.new(x=bar_index, y=entry_price, text=entry_label_text, color=color.green, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+        else
+            entry_price := breakout_price
+            current_entry_id := second_trade_taken ? "Instant Long 2nd" : "Instant Long"
+            strategy.entry(current_entry_id, strategy.long, qty=contracts)
+            if show_entry_labels
+                entry_label_text = second_trade_taken ? "BUY MARKET (2nd)\n" + str.tostring(entry_price, "#.##") : "BUY MARKET\n" + str.tostring(entry_price, "#.##")
+                label.new(x=bar_index, y=entry_price, text=entry_label_text, color=color.green, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+        risk_size = entry_price - stop_loss
+        take_profit := entry_price + (risk_size * risk_multiplier)
+
+        if use_trailing_sl
+            trailing_stop := stop_loss
+            trailing_active := true
+            initial_risk := math.abs(entry_price - stop_loss)
+            trailing_started := false
+            exit_id = second_trade_taken ? "Long Exit 2nd" : "Long Exit"
+            strategy.exit(exit_id, current_entry_id, stop=stop_loss, limit=take_profit)
+        else
+            exit_id = second_trade_taken ? "Long Exit 2nd" : "Long Exit"
+            strategy.exit(exit_id, current_entry_id, stop=stop_loss, limit=take_profit)
+
+        current_profit_box := box.new(left=bar_index, top=take_profit, right=bar_index + 8, bottom=entry_price, bgcolor=color.new(color.blue, 70), border_width=0)
+        current_sl_box := box.new(left=bar_index, top=entry_price, right=bar_index + 8, bottom=stop_loss, bgcolor=color.new(color.red, 70), border_width=0)
+        array.push(historical_trade_boxes, current_profit_box)
+        array.push(historical_sl_boxes, current_sl_box)
+        array.push(historical_tp_boxes, na)
+
+        if show_sl_tp_labels
+            label.new(x=bar_index, y=stop_loss, text="SL\n" + str.tostring(stop_loss, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+            label.new(x=bar_index, y=take_profit, text="TP\n" + str.tostring(take_profit, "#.##"), color=color.blue, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+        if second_trade_taken
+            second_entry_placed := true
+            daily_trades_complete := true
+        else
+            entry_placed := true
+
+    else if breakout_direction == "short"
+        if sl_type == "Breakout Candle"
+            stop_loss := breakout_candle_high + (sl_points * syminfo.mintick)
+        else
+            stop_loss := or_high + (sl_points * syminfo.mintick)
+
+        if entry_type == "Retracement"
+            breakout_candle_body = breakout_candle_high - breakout_candle_low
+            retracement_amount = breakout_candle_body * (retracement_percent / 100)
+            entry_price := breakout_candle_low + retracement_amount
+            current_entry_id := second_trade_taken ? "Short Retracement 2nd" : "Short Retracement"
+            strategy.entry(current_entry_id, strategy.short, limit=entry_price, qty=contracts)
+            if show_entry_labels
+                entry_label_text = second_trade_taken ? "SELL LIMIT (2nd)\n" + str.tostring(entry_price, "#.##") : "SELL LIMIT\n" + str.tostring(entry_price, "#.##")
+                label.new(x=bar_index, y=entry_price, text=entry_label_text, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+        else
+            entry_price := breakout_price
+            current_entry_id := second_trade_taken ? "Instant 2nd" : "Instant Short"
+            strategy.entry(current_entry_id, strategy.short, qty=contracts)
+            if show_entry_labels
+                entry_label_text = second_trade_taken ? "SELL MARKET (2nd)\n" + str.tostring(entry_price, "#.##") : "SELL MARKET\n" + str.tostring(entry_price, "#.##")
+                label.new(x=bar_index, y=entry_price, text=entry_label_text, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+        risk_size = stop_loss - entry_price
+        take_profit := entry_price - (risk_size * risk_multiplier)
+
+        if use_trailing_sl
+            trailing_stop := stop_loss
+            trailing_active := true
+            initial_risk := math.abs(entry_price - stop_loss)
+            trailing_started := false
+            exit_id = second_trade_taken ? "Short Exit 2nd" : "Short Exit"
+            strategy.exit(exit_id, current_entry_id, stop=stop_loss, limit=take_profit)
+        else
+            exit_id = second_trade_taken ? "Short Exit 2nd" : "Short Exit"
+            strategy.exit(exit_id, current_entry_id, stop=stop_loss, limit=take_profit)
+
+        current_profit_box := box.new(left=bar_index, top=entry_price, right=bar_index + 8, bottom=take_profit, bgcolor=color.new(color.blue, 70), border_width=0)
+        current_sl_box := box.new(left=bar_index, top=stop_loss, right=bar_index + 8, bottom=entry_price, bgcolor=color.new(color.red, 70), border_width=0)
+        array.push(historical_trade_boxes, current_profit_box)
+        array.push(historical_sl_boxes, current_sl_box)
+        array.push(historical_tp_boxes, na)
+
+        if show_sl_tp_labels
+            label.new(x=bar_index, y=stop_loss, text="SL\n" + str.tostring(stop_loss, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+            label.new(x=bar_index, y=take_profit, text="TP\n" + str.tostring(take_profit, "#.##"), color=color.blue, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+        if second_trade_taken
+            second_entry_placed := true
+            daily_trades_complete := true
+        else
+            entry_placed := true
+
+// === TRAILING STOP LOGIC ===
+if use_trailing_sl and trailing_active and strategy.position_size != 0 and not na(current_entry_id)
+    if strategy.position_size > 0
+        current_profit = close - entry_price
+        profit_r = current_profit / initial_risk
+
+        if not trailing_started and profit_r >= profit_r_multiplier
+            trailing_started := true
+            trailing_stop := math.max(trailing_stop, close - (atr * atr_multiplier))
+
+        if trailing_started
+            potential_new_stop = close - (atr * atr_multiplier)
+            if potential_new_stop > trailing_stop and potential_new_stop > stop_loss
+                trailing_stop := potential_new_stop
+                exit_id = second_trade_taken ? "Long Exit 2nd" : "Long Exit"
+                strategy.exit(exit_id, current_entry_id, stop=trailing_stop, limit=take_profit)
+
+    else if strategy.position_size < 0
+        current_profit = entry_price - close
+        profit_r = current_profit / initial_risk
+
+        if not trailing_started and profit_r >= profit_r_multiplier
+            trailing_started := true
+            trailing_stop := math.min(trailing_stop, close + (atr * atr_multiplier))
+
+        if trailing_started
+            potential_new_stop = close + (atr * atr_multiplier)
+            if potential_new_stop < trailing_stop and potential_new_stop < stop_loss
+                trailing_stop := potential_new_stop
+                exit_id = second_trade_taken ? "Short Exit 2nd" : "Short Exit"
+                strategy.exit(exit_id, current_entry_id, stop=trailing_stop, limit=take_profit)
+
+// === SESSION END CLOSE ===
+if force_session_close and current_hour == session_end_hour and current_minute == session_end_minute
+    if not na(current_profit_box)
+        box_left = box.get_left(current_profit_box)
+        min_right = box_left + 8
+        final_right = math.max(min_right, bar_index)
+        box.set_right(current_profit_box, final_right)
+        current_profit_box := na
+    if not na(current_sl_box)
+        box_left = box.get_left(current_sl_box)
+        min_right = box_left + 8
+        final_right = math.max(min_right, bar_index)
+        box.set_right(current_sl_box, final_right)
+        current_sl_box := na
+
+    strategy.close_all(comment="Session End Close")
+
+// === ALERTS ===
+alert_once_long = (strategy.position_size > 0) and (strategy.position_size[1] == 0)
+alert_once_short = (strategy.position_size < 0) and (strategy.position_size[1] == 0)
+
+alertcondition(alert_once_long, title="Long Entry (Once)", message="Long Entry Signal")
+alertcondition(alert_once_short, title="Short Entry (Once)", message="Short Entry Signal")
